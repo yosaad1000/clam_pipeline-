@@ -1,0 +1,68 @@
+name: Deploy to Raspberry Pi
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'pi_deploy/**'
+      - '.github/workflows/deploy-pi.yml'
+  workflow_dispatch:
+    inputs:
+      run_inference:
+        description: 'Run inference after deployment'
+        required: false
+        type: boolean
+        default: false
+      use_mxa:
+        description: 'Use Memryx MXA accelerator'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Sync files to Pi
+        env:
+          PI_HOST: ${{ secrets.PI_HOST || 'admin@20.0.0.154' }}
+          PI_PASS: ${{ secrets.PI_PASSWORD || 'admin' }}
+          PI_PATH: ${{ secrets.PI_PATH || '~/Desktop/clam_pipeline/pi_deploy' }}
+        run: |
+          sshpass -p "$PI_PASS" scp -o StrictHostKeyChecking=no \
+            pi_deploy/pipeline_mxa.py \
+            $PI_HOST:$PI_PATH/pipeline_mxa.py
+          
+          sshpass -p "$PI_PASS" scp -o StrictHostKeyChecking=no \
+            pi_deploy/checkpoints/s_0_checkpoint.pt \
+            $PI_HOST:$PI_PATH/checkpoints/s_0_checkpoint.pt || true
+
+      - name: Run inference (optional)
+        if: github.event.inputs.run_inference == 'true'
+        env:
+          PI_HOST: ${{ secrets.PI_HOST || 'admin@20.0.0.154' }}
+          PI_PASS: ${{ secrets.PI_PASSWORD || 'admin' }}
+          PI_PATH: ${{ secrets.PI_PATH || '~/Desktop/clam_pipeline/pi_deploy' }}
+          USE_MXA: ${{ github.event.inputs.use_mxa == 'true' && '--use_mxa' || '' }}
+        run: |
+          sshpass -p "$PI_PASS" ssh -o StrictHostKeyChecking=no $PI_HOST \
+            "cd $PI_PATH && source venv/bin/activate && \
+             python pipeline_mxa.py \
+               --input input/ \
+               --output output/ \
+               --batch \
+               $USE_MXA"
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment complete"
+          echo "Pi: ${{ secrets.PI_HOST || 'admin@20.0.0.154' }}"
+          echo "Inference: ${{ github.event.inputs.run_inference || 'false' }}"
+          echo "MXA: ${{ github.event.inputs.use_mxa || 'false' }}"

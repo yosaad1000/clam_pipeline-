@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Deploy Pipeline to Pi",
+  "description": "Whenever pipeline_mxa.py is saved, automatically syncs it to the Raspberry Pi at 20.0.0.154",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "pi_deploy/pipeline_mxa.py"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "pipeline_mxa.py was just saved. Run this command to sync it to the Pi: sshpass -p 'admin' scp -o StrictHostKeyChecking=no pi_deploy/pipeline_mxa.py admin@20.0.0.154:~/Desktop/clam_pipeline/pi_deploy/pipeline_mxa.py and confirm it succeeded."
+  }
+}
