@@ -17,9 +17,11 @@ fi
 mx_nc -v \
     --models resnet50_trunc.onnx \
     --autocrop \
+    --exp_auto_dp \
     --dfp_fname resnet50_trunc.dfp
 
 echo ""
 echo "=== Done! Generated: resnet50_trunc.dfp ==="
+echo "Compiled with experimental auto double precision (16-bit on critical layers)"
 echo "You can now run the pipeline:"
 echo "  python pipeline_mxa.py --input input/ --output output/ --batch"

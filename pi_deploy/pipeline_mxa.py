@@ -74,8 +74,7 @@ class MXAResNet50:
         self.mean = [0.485, 0.456, 0.406]
         self.std  = [0.229, 0.224, 0.225]
         self.transform = transforms.Compose([
-            transforms.Resize(224),
-            transforms.CenterCrop(224),
+            transforms.Resize(224),   # no CenterCrop — matches CPU path exactly
             transforms.ToTensor(),
             transforms.Normalize(self.mean, self.std),
         ])
@@ -87,8 +86,8 @@ class MXAResNet50:
         input_queue = []
 
         for i in range(len(tensors)):
-            # Memryx expects [1, C, H, W] — add batch dim to CHW tensor
-            inp = tensors[i].numpy()[np.newaxis, ...]  # [1,3,224,224]
+            # Memryx expects float32 [1, C, H, W]
+            inp = tensors[i].numpy().astype(np.float32)[np.newaxis, ...]  # [1,3,224,224]
             input_queue.append(inp)
 
         idx = [0]
@@ -101,13 +100,19 @@ class MXAResNet50:
             return None
 
         def collect_output(*outputs):
-            feat = outputs[0].copy()
+            feat = outputs[0].astype(np.float32).copy()  # force float32 after dequant
             # DFP outputs spatial feature maps [1, 1024, 14, 14] — apply GAP
             if feat.ndim == 4:
                 feat = feat.mean(axis=(2, 3))  # → [1, 1024]
             elif feat.ndim == 3:
                 feat = feat.mean(axis=(1, 2))  # → [1024]
-            results.append(feat.reshape(-1))
+            feat = feat.reshape(-1)
+            # L2 normalize — corrects for int8 dequant scale drift,
+            # makes features scale-invariant before CLAM attention
+            norm = np.linalg.norm(feat)
+            if norm > 0:
+                feat = feat / norm
+            results.append(feat)
 
         self.accl.connect_input(send_input, model_idx=0)
         self.accl.connect_output(collect_output, model_idx=0)
@@ -158,7 +163,11 @@ class PyTorchResNet50:
         with torch.no_grad():
             out = self.model(tensors)   # list of feature maps; out_indices=(3,) → [N, 1024, H, W]
             features = self.pool(out[0]).squeeze(-1).squeeze(-1)  # [N, 1024]
-        return features.cpu().numpy().astype(np.float32)
+        feats = features.cpu().numpy().astype(np.float32)
+        # L2 normalize — keeps both paths consistent with MXA path
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        norms = np.where(norms > 0, norms, 1.0)
+        return feats / norms
 
 # ── Step 1: Patch Extraction ──────────────────────────────────────────────────
 def step1(slide_path: Path, out: Path, patch_size: int, logger) -> dict:
@@ -296,6 +305,17 @@ def step3(slide_path: Path, out: Path, ckpt_path: Path,
 
     attn_pct = np.array([percentileofscore(attn, s) for s in attn])
 
+    # ── Variant 2: contrast-stretched scores (histogram equalization)
+    # Spreads the attention distribution across the full [0,100] range,
+    # restoring red/blue separation lost due to int8 quantization flattening.
+    attn_sorted = np.sort(attn)
+    attn_eq = np.array([percentileofscore(attn_sorted, s, kind="mean") for s in attn])
+
+    # ── Variant 3: same contrast stretch but mapped to RdBu_r
+    # RdBu_r: blue=low attention, red=high attention — perceptually cleaner
+    # than jet for diverging attention scores.
+    attn_eq_rdbu = attn_eq.copy()
+
     wsi_obj = WholeSlideImage(str(slide_path))
     try:
         _wsi = openslide.open_slide(str(slide_path))
@@ -310,25 +330,50 @@ def step3(slide_path: Path, out: Path, ckpt_path: Path,
         seg_level=seg_level, sthresh=8, mthresh=7, close=4, use_otsu=False,
         filter_params={"a_t": 100, "a_h": 16, "max_n_holes": 8}
     )
-    # Always vis_level=0 — matches server full-resolution heatmap
-    heatmap_pil = wsi_obj.visHeatmap(
+
+    # ── Variant 1: original behavior (percentile + jet) ──────────────────────
+    heatmap_v1 = wsi_obj.visHeatmap(
         scores=attn_pct, coords=coords, vis_level=0,
         patch_size=(patch_size, patch_size), alpha=alpha,
         blur=True, convert_to_percentiles=False,
         cmap="jet", blank_canvas=False, segment=True,
     )
+    jpg_v1 = step3_dir / f"{slide_name}_heatmap_original.jpg"
+    heatmap_v1.save(str(jpg_v1))
+    logger.info(f"[V1 original]          → {jpg_v1}")
 
-    jpg_path = step3_dir / f"{slide_name}_heatmap.jpg"
-    heatmap_pil.save(str(jpg_path))
-    logger.info(f"Saved heatmap → {jpg_path}")
+    # ── Variant 2: contrast-stretched + jet ──────────────────────────────────
+    heatmap_v2 = wsi_obj.visHeatmap(
+        scores=attn_eq, coords=coords, vis_level=0,
+        patch_size=(patch_size, patch_size), alpha=alpha,
+        blur=True, convert_to_percentiles=False,
+        cmap="jet", blank_canvas=False, segment=True,
+    )
+    jpg_v2 = step3_dir / f"{slide_name}_heatmap_contrast_stretch.jpg"
+    heatmap_v2.save(str(jpg_v2))
+    logger.info(f"[V2 contrast+jet]      → {jpg_v2}")
+
+    # ── Variant 3: contrast-stretched + RdBu_r ───────────────────────────────
+    heatmap_v3 = wsi_obj.visHeatmap(
+        scores=attn_eq_rdbu, coords=coords, vis_level=0,
+        patch_size=(patch_size, patch_size), alpha=alpha,
+        blur=True, convert_to_percentiles=False,
+        cmap="RdBu_r", blank_canvas=False, segment=True,
+    )
+    jpg_v3 = step3_dir / f"{slide_name}_heatmap_recalibrated.jpg"
+    heatmap_v3.save(str(jpg_v3))
+    logger.info(f"[V3 contrast+RdBu_r]   → {jpg_v3}")
+
+    # keep primary heatmap pointing to v1 for backward compat
+    jpg_path = jpg_v1
 
     # always save full-res TIFF (matches server behavior)
     import tifffile as _tifffile
-    tiff_path = step3_dir / f"{slide_name}_heatmap.tiff"
-    _tifffile.imwrite(str(tiff_path), np.array(heatmap_pil),
+    tiff_path = step3_dir / f"{slide_name}_heatmap_original.tiff"
+    _tifffile.imwrite(str(tiff_path), np.array(heatmap_v1),
                       photometric="rgb", compression="deflate",
                       metadata={"axes": "YXS"})
-    logger.info(f"Saved TIFF → {tiff_path}  size={heatmap_pil.size}")
+    logger.info(f"Saved TIFF → {tiff_path}  size={heatmap_v1.size}")
 
     wsi_raw  = wsi_obj.getOpenSlide()
     thumb_sz = wsi_raw.level_dimensions[0]
@@ -344,8 +389,15 @@ def step3(slide_path: Path, out: Path, ckpt_path: Path,
 
     elapsed = time.time() - t0
     logger.info(f"Step 3 done in {elapsed:.2f}s")
+    logger.info("Heatmap variants saved:")
+    logger.info(f"  V1 original (percentile+jet)      : {jpg_v1.name}")
+    logger.info(f"  V2 contrast stretch (eq+jet)       : {jpg_v2.name}")
+    logger.info(f"  V3 recalibrated (eq+RdBu_r)        : {jpg_v3.name}")
     return {"prediction": label_map[Y_hat_val], "prob_normal": float(probs[0]),
-            "prob_tumor": float(probs[1]), "heatmap": str(jpg_path),
+            "prob_tumor": float(probs[1]),
+            "heatmap_v1_original": str(jpg_v1),
+            "heatmap_v2_contrast_stretch": str(jpg_v2),
+            "heatmap_v3_recalibrated": str(jpg_v3),
             "heatmap_tiff": str(tiff_path),
             "timing_seconds": round(elapsed, 3)}
 
