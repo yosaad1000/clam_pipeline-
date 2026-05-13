@@ -106,10 +106,11 @@ class MXAResNet50:
                 feat = feat.mean(axis=(2, 3))  # → [1, 1024]
             elif feat.ndim == 3:
                 feat = feat.mean(axis=(1, 2))  # → [1024]
-            # DFP output is already L2-normalised (baked into ONNX export).
-            # CLAM attention is direction-based so magnitude difference vs
-            # PyTorch raw features does not affect the heatmap.
-            results.append(feat.reshape(-1))
+            feat = feat.reshape(-1)
+            # DFP outputs unit vectors (L2 norm baked in ONNX).
+            # PyTorch outputs raw features with magnitude ~44.
+            # Scale up to match so CLAM attention scores are identical.
+            results.append(feat * 44.0)
 
         self.accl.connect_input(send_input, model_idx=0)
         self.accl.connect_output(collect_output, model_idx=0)
