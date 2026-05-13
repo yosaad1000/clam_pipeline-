@@ -301,17 +301,6 @@ def step3(slide_path: Path, out: Path, ckpt_path: Path,
 
     attn_pct = np.array([percentileofscore(attn, s) for s in attn])
 
-    # ── Variant 2: contrast-stretched scores (histogram equalization)
-    # Spreads the attention distribution across the full [0,100] range,
-    # restoring red/blue separation lost due to int8 quantization flattening.
-    attn_sorted = np.sort(attn)
-    attn_eq = np.array([percentileofscore(attn_sorted, s, kind="mean") for s in attn])
-
-    # ── Variant 3: same contrast stretch but mapped to RdBu_r
-    # RdBu_r: blue=low attention, red=high attention — perceptually cleaner
-    # than jet for diverging attention scores.
-    attn_eq_rdbu = attn_eq.copy()
-
     wsi_obj = WholeSlideImage(str(slide_path))
     try:
         _wsi = openslide.open_slide(str(slide_path))
@@ -327,49 +316,23 @@ def step3(slide_path: Path, out: Path, ckpt_path: Path,
         filter_params={"a_t": 100, "a_h": 16, "max_n_holes": 8}
     )
 
-    # ── Variant 1: original behavior (percentile + jet) ──────────────────────
-    heatmap_v1 = wsi_obj.visHeatmap(
+    heatmap = wsi_obj.visHeatmap(
         scores=attn_pct, coords=coords, vis_level=0,
         patch_size=(patch_size, patch_size), alpha=alpha,
         blur=True, convert_to_percentiles=False,
         cmap="jet", blank_canvas=False, segment=True,
     )
-    jpg_v1 = step3_dir / f"{slide_name}_heatmap_original.jpg"
-    heatmap_v1.save(str(jpg_v1))
-    logger.info(f"[V1 original]          → {jpg_v1}")
+    jpg_path = step3_dir / f"{slide_name}_heatmap.jpg"
+    heatmap.save(str(jpg_path))
+    logger.info(f"Heatmap → {jpg_path}")
 
-    # ── Variant 2: contrast-stretched + jet ──────────────────────────────────
-    heatmap_v2 = wsi_obj.visHeatmap(
-        scores=attn_eq, coords=coords, vis_level=0,
-        patch_size=(patch_size, patch_size), alpha=alpha,
-        blur=True, convert_to_percentiles=False,
-        cmap="jet", blank_canvas=False, segment=True,
-    )
-    jpg_v2 = step3_dir / f"{slide_name}_heatmap_contrast_stretch.jpg"
-    heatmap_v2.save(str(jpg_v2))
-    logger.info(f"[V2 contrast+jet]      → {jpg_v2}")
-
-    # ── Variant 3: contrast-stretched + RdBu_r ───────────────────────────────
-    heatmap_v3 = wsi_obj.visHeatmap(
-        scores=attn_eq_rdbu, coords=coords, vis_level=0,
-        patch_size=(patch_size, patch_size), alpha=alpha,
-        blur=True, convert_to_percentiles=False,
-        cmap="RdBu_r", blank_canvas=False, segment=True,
-    )
-    jpg_v3 = step3_dir / f"{slide_name}_heatmap_recalibrated.jpg"
-    heatmap_v3.save(str(jpg_v3))
-    logger.info(f"[V3 contrast+RdBu_r]   → {jpg_v3}")
-
-    # keep primary heatmap pointing to v1 for backward compat
-    jpg_path = jpg_v1
-
-    # always save full-res TIFF (matches server behavior)
+    # always save full-res TIFF
     import tifffile as _tifffile
-    tiff_path = step3_dir / f"{slide_name}_heatmap_original.tiff"
-    _tifffile.imwrite(str(tiff_path), np.array(heatmap_v1),
+    tiff_path = step3_dir / f"{slide_name}_heatmap.tiff"
+    _tifffile.imwrite(str(tiff_path), np.array(heatmap),
                       photometric="rgb", compression="deflate",
                       metadata={"axes": "YXS"})
-    logger.info(f"Saved TIFF → {tiff_path}  size={heatmap_v1.size}")
+    logger.info(f"Saved TIFF → {tiff_path}  size={heatmap.size}")
 
     wsi_raw  = wsi_obj.getOpenSlide()
     thumb_sz = wsi_raw.level_dimensions[0]
@@ -385,15 +348,9 @@ def step3(slide_path: Path, out: Path, ckpt_path: Path,
 
     elapsed = time.time() - t0
     logger.info(f"Step 3 done in {elapsed:.2f}s")
-    logger.info("Heatmap variants saved:")
-    logger.info(f"  V1 original (percentile+jet)      : {jpg_v1.name}")
-    logger.info(f"  V2 contrast stretch (eq+jet)       : {jpg_v2.name}")
-    logger.info(f"  V3 recalibrated (eq+RdBu_r)        : {jpg_v3.name}")
     return {"prediction": label_map[Y_hat_val], "prob_normal": float(probs[0]),
             "prob_tumor": float(probs[1]),
-            "heatmap_v1_original": str(jpg_v1),
-            "heatmap_v2_contrast_stretch": str(jpg_v2),
-            "heatmap_v3_recalibrated": str(jpg_v3),
+            "heatmap_jpg": str(jpg_path),
             "heatmap_tiff": str(tiff_path),
             "timing_seconds": round(elapsed, 3)}
 
