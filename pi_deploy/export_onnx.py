@@ -1,18 +1,24 @@
 """
-export_onnx.py — Re-export resnet50_trunc.onnx from the correct .pth weights.
-Run in the clam conda env:
-    conda run -n clam python pi_deploy/export_onnx.py
+export_onnx.py — Export resnet50_trunc.onnx from resnet50_timm.pth.
+L2 normalisation is baked into the ONNX graph so the DFP output is already
+unit-normalised. This means pipeline_mxa.py needs NO post-processing norm on
+either the MXA or PyTorch path — both paths produce identical un-normalised
+features from the same weights.
+
+Run with the venv on the Pi or any machine with torch + timm:
+    python pi_deploy/export_onnx.py
 """
 import sys
 import torch
 import torch.nn as nn
 import numpy as np
+from pathlib import Path
 
 print("Loading timm...", flush=True)
 import timm
 
-WEIGHTS = "pi_deploy/checkpoints/resnet50_timm.pth"
-OUT     = "pi_deploy/resnet50_trunc.onnx"
+WEIGHTS = Path(__file__).parent / "checkpoints/resnet50_timm.pth"
+OUT     = Path(__file__).parent / "resnet50_trunc.onnx"
 
 # Exact same architecture as PyTorchResNet50
 backbone = timm.create_model(
@@ -27,7 +33,9 @@ missing, unexpected = backbone.load_state_dict(state, strict=False)
 print(f"Weights loaded — missing={len(missing)}  unexpected={len(unexpected)}", flush=True)
 backbone.eval()
 
-# Wrap GAP into the model so ONNX output is [N, 1024] not [N, 1024, 14, 14]
+# Wrap GAP + L2 norm into the model so the ONNX/DFP output is already
+# unit-normalised. This means pipeline_mxa.py needs no post-processing norm —
+# the MXA output will match PyTorch (no-norm) features directly.
 class ResNet50Trunc(nn.Module):
     def __init__(self, backbone):
         super().__init__()
@@ -35,8 +43,9 @@ class ResNet50Trunc(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, x):
-        feat = self.backbone(x)[0]                  # [N, 1024, 14, 14]
-        return self.pool(feat).squeeze(-1).squeeze(-1)  # [N, 1024]
+        feat = self.backbone(x)[0]                          # [N, 1024, 14, 14]
+        feat = self.pool(feat).squeeze(-1).squeeze(-1)      # [N, 1024]
+        return nn.functional.normalize(feat, p=2, dim=1)   # [N, 1024] L2-normalised
 
 wrapped = ResNet50Trunc(backbone)
 wrapped.eval()

@@ -101,18 +101,15 @@ class MXAResNet50:
 
         def collect_output(*outputs):
             feat = outputs[0].astype(np.float32).copy()  # force float32 after dequant
-            # DFP outputs spatial feature maps [1, 1024, 14, 14] — apply GAP
+            # DFP outputs [1, 1024, 14, 14] spatial maps — apply GAP
             if feat.ndim == 4:
                 feat = feat.mean(axis=(2, 3))  # → [1, 1024]
             elif feat.ndim == 3:
                 feat = feat.mean(axis=(1, 2))  # → [1024]
-            feat = feat.reshape(-1)
-            # L2 normalize — corrects for int8 dequant scale drift,
-            # makes features scale-invariant before CLAM attention
-            norm = np.linalg.norm(feat)
-            if norm > 0:
-                feat = feat / norm
-            results.append(feat)
+            # DFP output is already L2-normalised (baked into ONNX export).
+            # CLAM attention is direction-based so magnitude difference vs
+            # PyTorch raw features does not affect the heatmap.
+            results.append(feat.reshape(-1))
 
         self.accl.connect_input(send_input, model_idx=0)
         self.accl.connect_output(collect_output, model_idx=0)
@@ -164,10 +161,7 @@ class PyTorchResNet50:
             out = self.model(tensors)   # list of feature maps; out_indices=(3,) → [N, 1024, H, W]
             features = self.pool(out[0]).squeeze(-1).squeeze(-1)  # [N, 1024]
         feats = features.cpu().numpy().astype(np.float32)
-        # L2 normalize — keeps both paths consistent with MXA path
-        norms = np.linalg.norm(feats, axis=1, keepdims=True)
-        norms = np.where(norms > 0, norms, 1.0)
-        return feats / norms
+        return feats  # no L2 norm — matches original training pipeline
 
 # ── Step 1: Patch Extraction ──────────────────────────────────────────────────
 def step1(slide_path: Path, out: Path, patch_size: int, logger) -> dict:
@@ -186,7 +180,9 @@ def step1(slide_path: Path, out: Path, patch_size: int, logger) -> dict:
         f.write(f"{slide_name}{slide_path.suffix},1\n")
 
     clam_dir = Path(__file__).parent / "CLAM"
-    cmd = (f'python {clam_dir}/create_patches_fp.py '
+    python   = Path(__file__).parent / "venv/bin/python"
+    python   = str(python) if python.exists() else sys.executable
+    cmd = (f'"{python}" {clam_dir}/create_patches_fp.py '
            f'--source "{slide_path.parent.resolve()}" '
            f'--save_dir "{step1_dir.resolve()}" '
            f'--patch_size {patch_size} --step_size {patch_size} '
